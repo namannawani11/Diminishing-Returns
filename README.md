@@ -1,17 +1,16 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.optimize import curve_fit
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.linear_model import LinearRegression
 import warnings
 warnings.filterwarnings('ignore')
 
 # ================================================
-# 1. Load Your Data (Wide Format)
+# 1. Load Data
 # ================================================
 df_wide = pd.read_csv('media_data.csv', parse_dates=['month'])
-print("Columns:", df_wide.columns.tolist())
 
-# Define channels and their spend columns
 channel_map = {
     'Banner (Mosaic)': 'Banner_Spend',
     'Banner (Slider)': 'Mini_Spend',
@@ -19,49 +18,58 @@ channel_map = {
 }
 
 # ================================================
-# 2. Function to Fit & Plot One Channel
+# 2. Function to Analyze One Channel
 # ================================================
-def analyze_channel(channel_name, spend_col):
-    # Prepare data for this channel
+def analyze_channel(channel_name, spend_col, adstock_decay=0.7, poly_degree=2):
     data = pd.DataFrame({
         'month': df_wide['month'],
         'ad_spend': df_wide[spend_col],
-        'rsv': df_wide['RSV_$']          # Using total RSV (common proxy)
-    }).sort_values('month')
+        'rsv': df_wide['RSV_$']
+    }).sort_values('month').reset_index(drop=True)
     
     if data['ad_spend'].sum() == 0:
         print(f"Skipping {channel_name} - No spend")
-        return
+        return None
     
     print(f"\n=== {channel_name} ===")
     print(f"Total Spend: ${data['ad_spend'].sum():,.0f} | Total RSV: ${data['rsv'].sum():,.0f}")
     
-    # Adstock + Hill Model
-    def adstock_hill(spend, beta, ec, slope, decay):
-        adstocked = np.zeros_like(spend, dtype=float)
-        for t in range(len(spend)):
-            adstocked[t] = spend[t] + decay * (adstocked[t-1] if t > 0 else 0)
-        return beta * (adstocked ** slope) / (ec ** slope + adstocked ** slope)
+    # === Step 1: Apply Adstock ===
+    adstocked = np.zeros(len(data))
+    for t in range(len(data)):
+        adstocked[t] = data['ad_spend'].iloc[t] + adstock_decay * (adstocked[t-1] if t > 0 else 0)
+    data['adstocked_spend'] = adstocked
     
-    popt, _ = curve_fit(
-        adstock_hill,
-        data['ad_spend'].values,
-        data['rsv'].values,
-        p0=[data['rsv'].max()*1.5, data['ad_spend'].median()*1.3, 0.6, 0.65],
-        bounds=([0, 500, 0.1, 0.1], [np.inf, np.inf, 2.5, 0.95]),
-        maxfev=10000
-    )
+    # === Step 2: Polynomial Regression ===
+    X = data[['adstocked_spend']]
+    y = data['rsv']
     
-    print(f"Fitted → Beta: {popt[0]:,.0f} | EC: {popt[1]:,.0f} | Slope: {popt[2]:.3f} | Decay: {popt[3]:.3f}")
+    poly = PolynomialFeatures(degree=poly_degree)
+    X_poly = poly.fit_transform(X)
     
-    # Generate curves
-    spend_grid = np.linspace(data['ad_spend'].min()*0.1, data['ad_spend'].max()*1.4, 600)
-    response_grid = adstock_hill(spend_grid, *popt)
+    model = LinearRegression()
+    model.fit(X_poly, y)
     
-    eps = 1e-5
-    mroas_grid = (adstock_hill(spend_grid + eps, *popt) - response_grid) / eps
+    # === Step 3: Generate Curves ===
+    spend_grid = np.linspace(data['ad_spend'].min()*0.1, data['ad_spend'].max()*1.5, 600)
+    
+    # Adstock on grid (approximate)
+    adstock_grid = np.zeros_like(spend_grid)
+    for t in range(len(spend_grid)):
+        adstock_grid[t] = spend_grid[t] + adstock_decay * (adstock_grid[t-1] if t > 0 else 0)
+    
+    X_grid_poly = poly.transform(adstock_grid.reshape(-1, 1))
+    response_grid = model.predict(X_grid_poly)
+    
+    # Marginal ROAS (numerical derivative)
+    eps = 1e-4
+    response_plus = model.predict(poly.transform((adstock_grid + eps).reshape(-1, 1)))
+    mroas_grid = (response_plus - response_grid) / eps
+    
+    # Elasticity
     elasticity_grid = mroas_grid * (spend_grid / response_grid)
-    elasticity_grid = np.nan_to_num(elasticity_grid, nan=0)
+    elasticity_grid = np.nan_to_num(elasticity_grid, nan=0, posinf=0, neginf=0)
+    
     ar_ratio_grid = spend_grid / response_grid
     
     # Current values
@@ -69,18 +77,20 @@ def analyze_channel(channel_name, spend_col):
     current_rsv = data['rsv'].mean()
     current_ar = current_spend / current_rsv if current_rsv > 0 else 0
     
-    # Optimal at mROAS = 2.0 (you can change this)
+    # Optimal at mROAS ≈ 2.0
     idx_opt = np.argmin(np.abs(mroas_grid - 2.0))
     opt_ar = ar_ratio_grid[idx_opt]
     opt_spend = spend_grid[idx_opt]
     
-    # Plot
+    # ====================== PLOT ======================
     fig, ax1 = plt.subplots(figsize=(12, 7))
     
     ax1.plot(ar_ratio_grid, mroas_grid, 'b-', linewidth=3, label='Marginal ROAS')
     ax1.set_xlabel('Advertising Spend / Total RSV (A:R Ratio)', fontsize=12)
     ax1.set_ylabel('Marginal ROAS', color='blue', fontsize=12)
     ax1.tick_params(axis='y', labelcolor='blue')
+    
+    ax1.set_ylim(0, 5)                    # Y-axis limited to 0-5 as requested
     
     ax1.axhline(1.0, color='red', linestyle='--', lw=2, label='Break-even (mROAS=1)')
     ax1.axhline(2.0, color='green', linestyle=':', lw=2, label='Target mROAS=2')
@@ -94,20 +104,23 @@ def analyze_channel(channel_name, spend_col):
     ax1.scatter(ar_ratio_grid[idx_curr], mroas_grid[idx_curr], 
                 color='purple', s=150, zorder=5, label='Current Point')
     
-    plt.title(f'{channel_name}\nMarginal ROAS & Elasticity vs A:R Ratio', fontsize=14, pad=20)
+    plt.title(f'{channel_name}\nPolynomial Regression on Adstocked Spend', fontsize=14, pad=20)
     fig.legend(loc='upper right', bbox_to_anchor=(0.9, 0.9))
     ax1.grid(True, alpha=0.3)
     
-    # Text box with Current vs Optimal
+    # Text box
     textstr = f"""Current A:R  : {current_ar:.4f}
 Optimal A:R  : {opt_ar:.4f}
 Current Spend: ${current_spend:,.0f}/month
-Optimal Spend: ${opt_spend:,.0f}/month"""
+Optimal Spend: ${opt_spend:,.0f}/month
+Adstock Decay: {adstock_decay}"""
     
-    plt.gcf().text(0.15, 0.15, textstr, fontsize=11, bbox=dict(facecolor='white', alpha=0.8, boxstyle='round,pad=0.5'))
+    plt.gcf().text(0.15, 0.15, textstr, fontsize=11, 
+                   bbox=dict(facecolor='white', alpha=0.85, boxstyle='round,pad=0.5'))
     
     plt.tight_layout()
-    plt.savefig(f'{channel_name.replace(" ", "_").replace("(", "").replace(")", "")}_optimization.png', dpi=300, bbox_inches='tight')
+    safe_name = channel_name.replace(" ", "_").replace("(", "").replace(")", "")
+    plt.savefig(f'{safe_name}_optimization.png', dpi=300, bbox_inches='tight')
     plt.show()
     
     return {
@@ -115,7 +128,8 @@ Optimal Spend: ${opt_spend:,.0f}/month"""
         'current_ar': current_ar,
         'optimal_ar': opt_ar,
         'current_spend': current_spend,
-        'optimal_spend': opt_spend
+        'optimal_spend': opt_spend,
+        'adstock_decay': adstock_decay
     }
 
 # ================================================
@@ -123,13 +137,13 @@ Optimal Spend: ${opt_spend:,.0f}/month"""
 # ================================================
 results = []
 for channel_name, spend_col in channel_map.items():
-    res = analyze_channel(channel_name, spend_col)
+    res = analyze_channel(channel_name, spend_col, adstock_decay=0.65, poly_degree=2)
     if res:
         results.append(res)
 
-# Summary Table
 summary = pd.DataFrame(results)
-print("\n=== SUMMARY: Current vs Optimal A:R ===")
+print("\n=== SUMMARY: Current vs Optimal ===")
 print(summary.round(4))
 summary.to_csv('channel_optimization_summary.csv', index=False)
-print("\n✅ All plots saved as separate PNG files!")
+
+print("\n✅ Done! Check the three PNG files.")
